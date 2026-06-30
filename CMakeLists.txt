@@ -25,6 +25,11 @@ include(FetchContent)
 set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+if(UNIX AND NOT APPLE)
+  # Headless servers only need the X11 backend (Xvfb); skip Wayland so the
+  # build doesn't need wayland-protocols/xkbcommon dev packages.
+  set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(glfw
   GIT_REPOSITORY https://github.com/glfw/glfw.git
   GIT_TAG        3.4)
