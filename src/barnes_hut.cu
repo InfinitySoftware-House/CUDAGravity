@@ -556,7 +556,16 @@ Simulation::~Simulation() {
     cudaFree(code_);cudaFree(idx_);
 }
 
+void Simulation::centerOfMass(float& x, float& y, float& z) {
+    if(!treeBuilt_){ x=y=z=0.0f; return; }
+    // Root internal node (id 0) carries the total mass-weighted COM.
+    cudaMemcpy(&x, ncx_, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&y, ncy_, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&z, ncz_, sizeof(float), cudaMemcpyDeviceToHost);
+}
+
 void Simulation::buildTree() {
+    treeBuilt_ = true;
     int gn = grid(nbodies_);
     initBoundsKernel<<<1,1>>>();
     boundsKernel<<<gn,BLOCK>>>(posx_,posy_,posz_,nbodies_);

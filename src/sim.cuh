@@ -29,6 +29,11 @@ public:
     // (stride 4 floats: x, y, z, speed). Used to feed an OpenGL VBO.
     void copyToRenderBuffer(float* d_dst);
 
+    // Mass-weighted centre of mass of all bodies. Read from the tree root, so
+    // it is valid after the first step()/computeAccelOnly(); falls back to the
+    // origin before the tree has been built.
+    void centerOfMass(float& x, float& y, float& z);
+
     // Diagnostics / test entry points.
     void computeAccelOnly();                       // BH accel for current state
     void computeDirectReference(float* d_ax, float* d_ay, float* d_az);
@@ -54,6 +59,7 @@ private:
     int   nbodies_   = 0;
     int   capacity_  = 0;      // total tree-node slots (2n)
     float worldRadius_ = 1.2f;
+    bool  treeBuilt_ = false;  // root COM valid once a tree has been built
 
     // Per-body arrays (size n).
     float* posx_ = nullptr; float* posy_ = nullptr; float* posz_ = nullptr;

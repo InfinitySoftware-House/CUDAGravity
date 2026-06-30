@@ -94,6 +94,9 @@ static bool  g_toggleRecord=false;     // edge flag set by key
 static int   g_preset=1;               // active IC template (1..6)
 static bool  g_restart=false;          // edge flag: rebuild sim with g_preset
 static bool  g_clouds=true;            // render ambient nebulae + dust
+static bool  g_orbit=false;            // auto-orbit the centre of mass
+static float g_orbAz=0.0f, g_orbEl=0.35f, g_orbR=4.0f;   // orbit angle/elev/radius
+static float g_orbSpeed=0.0035f;       // radians per frame
 static double g_lastX=0, g_lastY=0;
 
 static void vnorm(float*v){ float l=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(l>1e-8f){v[0]/=l;v[1]/=l;v[2]/=l;} }
@@ -105,7 +108,10 @@ static void vrot(float*v,const float*k,float ang){
     for(int i=0;i<3;++i) v[i]=v[i]*c + cx[i]*s + k[i]*kv*(1.0f-c);
 }
 static void camReset(){
-    g_camPos[0]=1.6f; g_camPos[1]=1.3f; g_camPos[2]=2.2f;
+    // Big Bang fills a much larger volume (R0~3.2) than the galaxy presets, so
+    // start the camera further back to frame the whole forming cosmic web.
+    float d = (g_preset==7) ? 8.0f : 1.0f;
+    g_camPos[0]=1.6f*d; g_camPos[1]=1.3f*d; g_camPos[2]=2.2f*d;
     float f[3]={-g_camPos[0],-g_camPos[1],-g_camPos[2]}; vnorm(f);
     float wup[3]={0,1,0}, r[3]; vcross(f,wup,r); vnorm(r);
     float u[3]; vcross(r,f,u);
@@ -132,6 +138,7 @@ static void onKey(GLFWwindow*w,int key,int,int act,int){ if(act!=GLFW_PRESS)retu
     if(key==GLFW_KEY_V)      g_mode^=1;
     if(key==GLFW_KEY_C)      g_toggleRecord=true;
     if(key==GLFW_KEY_N)      g_clouds=!g_clouds;
+    if(key==GLFW_KEY_O)      g_orbit=!g_orbit;
     if(key>=GLFW_KEY_1 && key<=GLFW_KEY_7){ g_preset=key-GLFW_KEY_0; g_restart=true; }
     if(key==GLFW_KEY_R)      camReset(); }
 
@@ -364,7 +371,8 @@ static void buildCloudAttrs(int nStars,int nGas,int nDust, std::vector<float>& a
 
 static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
                      bool autoRecord, int autoRecFrames,
-                     bool headless, int recFps, int subSteps) {
+                     bool headless, int recFps, int subSteps,
+                     int capW, int capH, int recCrf, bool orbitOn) {
     if(!glfwInit()){ std::fprintf(stderr,"glfwInit failed\n"); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
@@ -386,6 +394,9 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
     }
     if(recFps<1) recFps=60;
     if(subSteps<1) subSteps=1;
+    if(capW<16) capW=1920; if(capH<16) capH=1080;
+    capW&=~1; capH&=~1;                       // x264 yuv420p needs even dimensions
+    if(recCrf<0) recCrf=18; if(recCrf>51) recCrf=51;
 
     GLuint progStars = program(kStarVert,kStarFrag);
     GLuint progNebula= programNoise(kCloudVert,kNebulaFrag);
@@ -479,17 +490,18 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
     g_preset = p.preset;
     std::printf("Viewer: %d stars + %d gas + %d dust = %d bodies.\n"
         "  drag look | WASD move | Q/E down-up | Shift faster | scroll dolly | Space pause\n"
-        "  V velocity | X auto-spin | N nebulae/dust | C record | R reset cam | Esc quit\n"
+        "  V velocity | X auto-spin | N nebulae/dust | O orbit COM | C record | R reset cam | Esc quit\n"
         "  presets: 1 spiral  2 collision  3 minor-merger  4 collapse  5 explosion  6 head-on  7 BIG BANG(1M)\n",
         nStars,nGas,nDust,total);
     camReset();
+    g_orbit = orbitOn;
 
     // HDR pipeline buffers, sized to the current render resolution.
     FBO scene, blurA, blurB, capture;       // capture = LDR target for video frames
     int curW=0, curH=0;                      // 0 -> (re)build on first frame
 
-    // recording: always captured at >=1080p, independent of the window size.
-    const int CAP_W=1920, CAP_H=1080;
+    // recording resolution (CLI --width/--height), independent of window size.
+    const int CAP_W=capW, CAP_H=capH;
     FILE* ffmpeg=nullptr; int recW=0, recH=0;
     std::vector<unsigned char> frame;
     std::string lastFile;
@@ -497,6 +509,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
 
     double fpsT=glfwGetTime(); int frames=0;
     double recStartT=0, lastFrameT=glfwGetTime();   // headless progress timing
+    bool orbitPrev=false; float com[3]={0,0,0};     // auto-orbit state
     if(autoRecord) g_toggleRecord=true;      // begin recording on the first frame
 
     while(!glfwWindowShouldClose(win)){
@@ -506,7 +519,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
             g_restart=false;
             p.preset=g_preset;
             int ns,ng,nd; countsFor(p.preset,ns,ng,nd);
-            if(ns!=nStars||ng!=nGas||nd!=nDust) buildBodyBuffers(ns,ng,nd);
+            if(ns!=nStars||ng!=nGas||nd!=nDust){ buildBodyBuffers(ns,ng,nd); camReset(); }
             p.n=nStars; p.nGas=nGas; p.nDust=nDust;
             delete sim; sim=new Simulation(p);   // re-seeds stars + gas + dust
             g_paused=false;
@@ -531,8 +544,8 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
                     std::snprintf(cmd,sizeof(cmd),
                         "ffmpeg -y -loglevel error -f rawvideo -pixel_format rgba "
                         "-video_size %dx%d -framerate %d -i - -vf vflip -an "
-                        "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p %s",
-                        recW,recH,recFps,lastFile.c_str());
+                        "-c:v libx264 -preset slow -crf %d -pix_fmt yuv420p %s",
+                        recW,recH,recFps,recCrf,lastFile.c_str());
                     ffmpeg=_popen(cmd,"wb");
                     if(ffmpeg){ recording=true; std::printf("[REC] recording %dx%d @%dfps -> %s\n",recW,recH,recFps,lastFile.c_str()); }
                     else std::printf("[REC] failed to launch ffmpeg.\n");
@@ -570,6 +583,27 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         if(glfwGetKey(win,GLFW_KEY_E)==GLFW_PRESS) moveCam(g_u, spd);
         if(glfwGetKey(win,GLFW_KEY_Q)==GLFW_PRESS) moveCam(g_u,-spd);
         if(g_autospin){ vrot(g_f,g_u,0.0015f); vrot(g_r,g_u,0.0015f); }
+
+        // --- auto-orbit the centre of mass (O / --orbit) ---
+        sim->centerOfMass(com[0],com[1],com[2]);
+        if(g_orbit){
+            if(!orbitPrev){                                   // seed from current view (no jump)
+                float dx=g_camPos[0]-com[0], dy=g_camPos[1]-com[1], dz=g_camPos[2]-com[2];
+                g_orbR=std::sqrt(dx*dx+dy*dy+dz*dz); if(g_orbR<0.2f) g_orbR=0.2f;
+                g_orbAz=std::atan2(dz,dx);
+                g_orbEl=std::asin(std::max(-0.99f,std::min(0.99f,dy/g_orbR)));
+            }
+            g_orbAz += g_orbSpeed;
+            float ce=std::cos(g_orbEl), se=std::sin(g_orbEl);
+            g_camPos[0]=com[0]+g_orbR*std::cos(g_orbAz)*ce;
+            g_camPos[1]=com[1]+g_orbR*se;
+            g_camPos[2]=com[2]+g_orbR*std::sin(g_orbAz)*ce;
+            float f[3]={com[0]-g_camPos[0],com[1]-g_camPos[1],com[2]-g_camPos[2]}; vnorm(f);
+            float wup[3]={0,1,0}, r[3]; vcross(f,wup,r); vnorm(r);
+            float u[3]; vcross(r,f,u);
+            for(int i=0;i<3;++i){ g_f[i]=f[i]; g_r[i]=r[i]; g_u[i]=u[i]; }
+        }
+        orbitPrev=g_orbit;
 
         float camDist=std::sqrt(g_camPos[0]*g_camPos[0]+g_camPos[1]*g_camPos[1]+g_camPos[2]*g_camPos[2]);
         float ctr[3]={g_camPos[0]+g_f[0], g_camPos[1]+g_f[1], g_camPos[2]+g_f[2]};
@@ -725,16 +759,21 @@ int main(int argc,char** argv){
     SimParams p; enum { VIEW, BENCH, VERIFY } mode=VIEW; int steps=200;
     bool autoRecord=false; int autoRecFrames=0;
     bool headless=false; int recFps=60, subSteps=1;
+    int capW=1920, capH=1080, recCrf=18; bool orbitOn=false;
     int nArg=-1, gasArg=-1, dustArg=-1;        // <0 -> use per-preset default
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--bench") mode=BENCH;
         else if(a=="--verify") mode=VERIFY;
         else if(a=="--record") autoRecord=true;
         else if(a=="--headless") headless=true;
+        else if(a=="--orbit") orbitOn=true;
         else if(a=="--nogas"){ gasArg=0; dustArg=0; }
         else if(a.rfind("--recframes=",0)==0){ autoRecord=true; autoRecFrames=std::atoi(a.c_str()+12); }
         else if(a.rfind("--fps=",0)==0)   recFps=std::atoi(a.c_str()+6);
         else if(a.rfind("--substeps=",0)==0) subSteps=std::atoi(a.c_str()+11);
+        else if(a.rfind("--width=",0)==0) capW=std::atoi(a.c_str()+8);
+        else if(a.rfind("--height=",0)==0)capH=std::atoi(a.c_str()+9);
+        else if(a.rfind("--crf=",0)==0)   recCrf=std::atoi(a.c_str()+6);
         else if(a.rfind("--n=",0)==0)     nArg=std::atoi(a.c_str()+4);
         else if(a.rfind("--gas=",0)==0)   gasArg=std::atoi(a.c_str()+6);
         else if(a.rfind("--dust=",0)==0)  dustArg=std::atoi(a.c_str()+7);
@@ -749,5 +788,5 @@ int main(int argc,char** argv){
     // star/gas/dust counts per preset (see countsFor in runViewer).
     switch(mode){ case BENCH: return runBench(p,steps); case VERIFY: return runVerify(p);
                   default: return runViewer(p,nArg,gasArg,dustArg,autoRecord,autoRecFrames,
-                                            headless,recFps,subSteps); }
+                                            headless,recFps,subSteps,capW,capH,recCrf,orbitOn); }
 }
