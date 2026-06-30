@@ -18,6 +18,10 @@ endif()
 include(FetchContent)
 
 # --- GLFW (windowing / input) ---
+# On Linux this needs X11/Wayland dev headers at build time (e.g. Debian/Ubuntu:
+# `apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+# libgl1-mesa-dev`), and a display (real, VNC, or Xvfb) at run time even for the
+# hidden window used by `--headless` recording.
 set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

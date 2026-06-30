@@ -34,6 +34,35 @@ cmake --build build
 
 For a different GPU, override the arch, e.g. `-DCMAKE_CUDA_ARCHITECTURES=89`.
 
+## Build (Linux)
+
+Requires: CUDA Toolkit 12.x, CMake ≥ 3.24, Git, a C++17 compiler, and X11 dev
+headers for GLFW (Debian/Ubuntu: `sudo apt install libx11-dev libxrandr-dev
+libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev`). GLFW and GLAD are
+fetched automatically by CMake.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/gravity --bench
+./build/gravity --verify
+```
+
+Override GPU arch the same way as Windows if `native` detection fails.
+
+`--headless` recording still opens a hidden GLFW window (offscreen GL
+context), so it needs a display even though nothing is shown. On a server
+with no X session, run it under a virtual one:
+
+```sh
+sudo apt install xvfb
+xvfb-run -a ./build/gravity --headless --preset=7 --orbit \
+  --width=1920 --height=1080 --crf=16 --dt=0.002 --theta=0.7 \
+  --substeps=24 --recframes=1000
+```
+
+ffmpeg must also be on `PATH` (`sudo apt install ffmpeg`).
+
 ## Run
 
 ```bat

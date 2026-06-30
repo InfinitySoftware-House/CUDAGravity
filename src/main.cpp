@@ -69,6 +69,14 @@ static int runVerify(SimParams p) {
 #include <GLFW/glfw3.h>
 #include <cuda_gl_interop.h>
 
+#ifdef _WIN32
+  #define popenCompat  _popen
+  #define pcloseCompat _pclose
+#else
+  #define popenCompat  popen
+  #define pcloseCompat pclose
+#endif
+
 // --- minimal 4x4 matrix math (column-major, GL style) ---
 struct Mat4 { float m[16]; };
 static Mat4 identity(){ Mat4 r{}; for(int i=0;i<4;++i) r.m[i*4+i]=1.0f; return r; }
@@ -338,7 +346,11 @@ static void makeFBO8(FBO& f,int w,int h){
     glBindFramebuffer(GL_FRAMEBUFFER,0);
 }
 
+#ifdef _WIN32
 static bool ffmpegAvailable(){ return std::system("ffmpeg -version >nul 2>&1") == 0; }
+#else
+static bool ffmpegAvailable(){ return std::system("ffmpeg -version >/dev/null 2>&1") == 0; }
+#endif
 
 // Compile a program after splicing the shared noise GLSL into the "%NOISE%"
 // marker of the fragment source.
@@ -546,13 +558,13 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
                         "-video_size %dx%d -framerate %d -i - -vf vflip -an "
                         "-c:v libx264 -preset slow -crf %d -pix_fmt yuv420p %s",
                         recW,recH,recFps,recCrf,lastFile.c_str());
-                    ffmpeg=_popen(cmd,"wb");
+                    ffmpeg=popenCompat(cmd,"wb");
                     if(ffmpeg){ recording=true; std::printf("[REC] recording %dx%d @%dfps -> %s\n",recW,recH,recFps,lastFile.c_str()); }
                     else std::printf("[REC] failed to launch ffmpeg.\n");
                 }
             } else {
                 recording=false;
-                if(ffmpeg){ _pclose(ffmpeg); ffmpeg=nullptr; }
+                if(ffmpeg){ pcloseCompat(ffmpeg); ffmpeg=nullptr; }
                 std::printf("[REC] saved %s\n", lastFile.c_str());
             }
         }
@@ -745,7 +757,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
     }
     if(headless) std::printf("\n");
 
-    if(ffmpeg) _pclose(ffmpeg);
+    if(ffmpeg) pcloseCompat(ffmpeg);
     delete sim;
     glDeleteBuffers(1,&vboStar);  glDeleteVertexArrays(1,&starVao);
     glDeleteBuffers(1,&vboCloud); glDeleteVertexArrays(1,&cloudVao);
