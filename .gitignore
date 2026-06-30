@@ -1,0 +1,76 @@
+# CMake build trees (FetchContent deps land under build/_deps/)
+build/
+out/
+cmake-build-*/
+
+# CMake generated files (in-source or stray configure output)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Makefile
+_deps/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.lo
+*.slo
+*.gch
+*.pch
+*.lib
+*.a
+*.la
+*.dll
+*.so
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# CUDA build artifacts
+*.cubin
+*.ptx
+*.fatbin
+
+# MSVC / Windows linker debug info
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.iobj
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.user
+x64/
+x86/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# VS Code / Cursor (local editor settings)
+.vscode/
+*.code-workspace
+
+# clangd / tooling cache
+.cache/
+compile_commands.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Screen captures from the simulator
+gravity_capture_*.mp4
+*.mp4
