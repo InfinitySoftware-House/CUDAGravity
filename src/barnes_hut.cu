@@ -44,6 +44,15 @@ static inline int grid(int nthreads) { return (nthreads + BLOCK - 1) / BLOCK; }
 __device__ float d_minx, d_maxx, d_miny, d_maxy, d_minz, d_maxz;
 __device__ float d_cubeMinX, d_cubeMinY, d_cubeMinZ, d_cubeInv;
 
+// Static analytic dark-matter halos (NFW) + cosmological Lambda term. Tiny
+// fixed-size table in constant memory -- broadcast to every thread for
+// free, no extra global-memory traffic per body.
+#define MAX_HALOS 4
+__constant__ int   d_haloCount;
+__constant__ float d_haloX[MAX_HALOS], d_haloY[MAX_HALOS], d_haloZ[MAX_HALOS];
+__constant__ float d_haloMs[MAX_HALOS], d_haloRs[MAX_HALOS];
+__constant__ float d_lambdaTerm;
+
 // ----- atomic float min/max ----------------------------------------------
 __device__ __forceinline__ float atomicMinf(float* addr, float val) {
     int* ai = (int*)addr; int old = *ai, assumed;
@@ -161,6 +170,7 @@ __global__ void initLeavesKernel(const float* px, const float* py, const float* 
                                  float4* ncom, float* nsize2,
                                  float* nminx, float* nminy, float* nminz,
                                  float* nmaxx, float* nmaxy, float* nmaxz,
+                                 float4* nquadA, float* nquadB,
                                  int* visited) {
     for (int p = blockIdx.x*blockDim.x+threadIdx.x; p < n; p += blockDim.x*gridDim.x) {
         int node = (n-1) + p;
@@ -171,6 +181,7 @@ __global__ void initLeavesKernel(const float* px, const float* py, const float* 
         nminx[node]=nmaxx[node]=x;
         nminy[node]=nmaxy[node]=y;
         nminz[node]=nmaxz[node]=z;
+        if (nquadA) { nquadA[node]=make_float4(0,0,0,0); nquadB[node]=0.0f; } // point mass -> zero quadrupole
         if (p < n-1) visited[p] = 0;     // reset internal-node counters
     }
 }
@@ -178,6 +189,7 @@ __global__ void summarizeKernel(const int* parent, const int* left, const int* r
                                 int n, float4* ncom, float* nsize2,
                                 float* nminx, float* nminy, float* nminz,
                                 float* nmaxx, float* nmaxy, float* nmaxz,
+                                float4* nquadA, float* nquadB,
                                 int* visited) {
     for (int p = blockIdx.x*blockDim.x+threadIdx.x; p < n; p += blockDim.x*gridDim.x) {
         int cur = parent[(n-1) + p];
@@ -188,15 +200,36 @@ __global__ void summarizeKernel(const int* parent, const int* left, const int* r
             float4 ca = ncom[a], cb = ncom[b];
             float ma = ca.w, mb = cb.w, m = ma + mb;
             float inv = (m > 0.0f) ? 1.0f/m : 0.0f;
-            ncom[cur] = make_float4((ma*ca.x + mb*cb.x) * inv,
-                                    (ma*ca.y + mb*cb.y) * inv,
-                                    (ma*ca.z + mb*cb.z) * inv, m);
+            float cx = (ma*ca.x + mb*cb.x) * inv;
+            float cy = (ma*ca.y + mb*cb.y) * inv;
+            float cz = (ma*ca.z + mb*cb.z) * inv;
+            ncom[cur] = make_float4(cx, cy, cz, m);
             float mnx=fminf(nminx[a],nminx[b]), mny=fminf(nminy[a],nminy[b]), mnz=fminf(nminz[a],nminz[b]);
             float mxx=fmaxf(nmaxx[a],nmaxx[b]), mxy=fmaxf(nmaxy[a],nmaxy[b]), mxz=fmaxf(nmaxz[a],nmaxz[b]);
             nminx[cur]=mnx; nminy[cur]=mny; nminz[cur]=mnz;
             nmaxx[cur]=mxx; nmaxy[cur]=mxy; nmaxz[cur]=mxz;
             float s = fmaxf(mxx-mnx, fmaxf(mxy-mny, mxz-mnz));
             nsize2[cur] = s*s;             // precompute size^2 -> forces read 1 float
+            if (nquadA) {
+                // Exact parallel-axis combination of two traceless quadrupole
+                // tensors about their common new centre of mass (Steiner's
+                // theorem generalised to the quadrupole moment):
+                //   Q_new = Qa + ma*(3 da(x)da - |da|^2 I)
+                //         + Qb + mb*(3 db(x)db - |db|^2 I)
+                // where da,db are the child COMs relative to the merged COM.
+                float4 qa = nquadA[a]; float qayz = nquadB[a];
+                float4 qb = nquadA[b]; float qbyz = nquadB[b];
+                float dax=ca.x-cx, day=ca.y-cy, daz=ca.z-cz;
+                float dbx=cb.x-cx, dby=cb.y-cy, dbz=cb.z-cz;
+                float da2=dax*dax+day*day+daz*daz, db2=dbx*dbx+dby*dby+dbz*dbz;
+                float qxx = qa.x + qb.x + ma*(3.0f*dax*dax-da2) + mb*(3.0f*dbx*dbx-db2);
+                float qxy = qa.y + qb.y + ma*(3.0f*dax*day)     + mb*(3.0f*dbx*dby);
+                float qxz = qa.z + qb.z + ma*(3.0f*dax*daz)     + mb*(3.0f*dbx*dbz);
+                float qyy = qa.w + qb.w + ma*(3.0f*day*day-da2) + mb*(3.0f*dby*dby-db2);
+                float qyz = qayz + qbyz + ma*(3.0f*day*daz)     + mb*(3.0f*dby*dbz);
+                nquadA[cur] = make_float4(qxx,qxy,qxz,qyy);
+                nquadB[cur] = qyz;
+            }
             __threadfence();
             if (cur == 0) break;
             cur = parent[cur];
@@ -205,11 +238,16 @@ __global__ void summarizeKernel(const int* parent, const int* left, const int* r
 }
 
 // ----- force calculation --------------------------------------------------
+// Barnes-Hut acceptance criterion (nsize2 < theta^2 r^2) is unaffected by
+// multipole order: it decides when the *approximation* is trusted, and the
+// quadrupole term below just makes that approximation more accurate at the
+// same theta (or lets theta grow for the same accuracy -> fewer nodes opened).
 __global__ void forcesKernel(const float* px, const float* py, const float* pz,
                              const int* idx, const int* left, const int* right,
                              const float4* __restrict__ ncom, const float* __restrict__ nsize2,
+                             const float4* __restrict__ nquadA, const float* __restrict__ nquadB,
                              float* ax, float* ay, float* az,
-                             int n, float theta, float eps2, float G) {
+                             int n, float theta, float eps2, float G, bool useQuad) {
     const float theta2 = theta*theta;
     int stack[64];
     // Iterate bodies in Morton-sorted order so neighbouring threads in a warp
@@ -226,15 +264,31 @@ __global__ void forcesKernel(const float* px, const float* py, const float* pz,
             float4 c = ncom[node];
             float dx=c.x-bx, dy=c.y-by, dz=c.z-bz;
             float r2 = dx*dx+dy*dy+dz*dz+eps2;
-            if (node >= n-1) {                // leaf: c.xyz is the body, c.w its mass
-                if (idx[node-(n-1)] == i) continue;
+            bool isLeaf = node >= n-1;
+            if (isLeaf && idx[node-(n-1)] == i) continue;   // self
+            if (isLeaf || nsize2[node] < theta2*r2) {        // leaf, or far enough -> approximate
                 float inv = rsqrtf(r2);
-                float f = G*c.w*inv*inv*inv;
+                float inv2 = inv*inv, inv3 = inv2*inv;
+                float f = G*c.w*inv3;
                 fx+=f*dx; fy+=f*dy; fz+=f*dz;
-            } else if (nsize2[node] < theta2*r2) {   // far enough -> approximate
-                float inv = rsqrtf(r2);
-                float f = G*c.w*inv*inv*inv;
-                fx+=f*dx; fy+=f*dy; fz+=f*dz;
+                if (useQuad && !isLeaf) {
+                    // Quadrupole correction to the point-mass (monopole) term
+                    // (Barnes 1986 / Hernquist 1987 tree codes). Note dx,dy,dz
+                    // here point from the field body TOWARD the source (matches
+                    // the monopole term above), which is the *negative* of the
+                    // "R from source to field point" convention the textbook
+                    // formula a_k = G(Q_kj R_j)/R^5 - (5/2)G(Q_ij R_i R_j)R_k/R^7
+                    // is written in; substituting R=-dx flips the overall sign.
+                    float4 qa = nquadA[node]; float qyz = nquadB[node];
+                    float qxx=qa.x, qxy=qa.y, qxz=qa.z, qyy=qa.w, qzz=-(qxx+qyy);
+                    float inv5 = inv3*inv2, inv7 = inv5*inv2;
+                    float Qrr = qxx*dx*dx + qyy*dy*dy + qzz*dz*dz
+                              + 2.0f*qxy*dx*dy + 2.0f*qxz*dx*dz + 2.0f*qyz*dy*dz;
+                    float coef = 2.5f*G*Qrr*inv7;
+                    fx += -G*(qxx*dx+qxy*dy+qxz*dz)*inv5 + coef*dx;
+                    fy += -G*(qxy*dx+qyy*dy+qyz*dz)*inv5 + coef*dy;
+                    fz += -G*(qxz*dx+qyz*dy+qzz*dz)*inv5 + coef*dz;
+                }
             } else if (sp < 62) {             // open
                 stack[sp++] = left[node]; stack[sp++] = right[node];
             }
@@ -243,16 +297,53 @@ __global__ void forcesKernel(const float* px, const float* py, const float* pz,
     }
 }
 
-__global__ void integrateKernel(float* px, float* py, float* pz,
-                                float* vx, float* vy, float* vz,
-                                const float* ax, const float* ay, const float* az,
-                                int n, float dt, float damping) {
+// External, non-tree accelerations layered on top of the N-body gravity:
+// static analytic NFW dark-matter halo(s) (one per galaxy) and, for the
+// cosmological preset, the Lambda (dark-energy) term of the Friedmann
+// acceleration equation. Both are O(1) per body -- negligible next to the
+// tree traversal -- so real dark-matter/cosmology physics costs almost
+// nothing on top of the N-body solve, which is what keeps this practical on
+// a single consumer GPU instead of needing a live N-body DM component.
+__global__ void externalAccelKernel(const float* px, const float* py, const float* pz,
+                                    float* ax, float* ay, float* az, int n, float G) {
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += blockDim.x*gridDim.x) {
-        float nvx=(vx[i]+ax[i]*dt)*damping;
-        float nvy=(vy[i]+ay[i]*dt)*damping;
-        float nvz=(vz[i]+az[i]*dt)*damping;
-        vx[i]=nvx; vy[i]=nvy; vz[i]=nvz;
-        px[i]+=nvx*dt; py[i]+=nvy*dt; pz[i]+=nvz*dt;
+        float bx=px[i], by=py[i], bz=pz[i];
+        float fx=0.0f, fy=0.0f, fz=0.0f;
+        for (int h = 0; h < d_haloCount; ++h) {
+            float dx=d_haloX[h]-bx, dy=d_haloY[h]-by, dz=d_haloZ[h]-bz;
+            float r2 = dx*dx+dy*dy+dz*dz;
+            float r  = sqrtf(r2) + 1e-6f;
+            float xr = r/d_haloRs[h];
+            float menc = d_haloMs[h] * (logf(1.0f+xr) - xr/(1.0f+xr));  // NFW enclosed mass
+            float f = G*menc/(r2*r);
+            fx+=f*dx; fy+=f*dy; fz+=f*dz;
+        }
+        if (d_lambdaTerm != 0.0f) { fx += d_lambdaTerm*bx; fy += d_lambdaTerm*by; fz += d_lambdaTerm*bz; }
+        ax[i]+=fx; ay[i]+=fy; az[i]+=fz;
+    }
+}
+
+// Leapfrog (kick-drift-kick, symplectic, 2nd-order) integrator. Splitting a
+// single-force-eval step into two half-kicks around one drift lets us reuse
+// the same acceleration for the end of this step and the start of the next,
+// so it costs exactly one tree build + force pass per step -- same as the
+// old 1st-order symplectic-Euler scheme -- but conserves energy/angular
+// momentum far better over long integrations (essential for anything
+// claiming to be a real orbit/structure-formation simulation).
+__global__ void kickKernel(float* vx, float* vy, float* vz,
+                           const float* ax, const float* ay, const float* az,
+                           int n, float dtHalf, float dampHalf) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += blockDim.x*gridDim.x) {
+        vx[i]=(vx[i]+ax[i]*dtHalf)*dampHalf;
+        vy[i]=(vy[i]+ay[i]*dtHalf)*dampHalf;
+        vz[i]=(vz[i]+az[i]*dtHalf)*dampHalf;
+    }
+}
+__global__ void driftKernel(float* px, float* py, float* pz,
+                            const float* vx, const float* vy, const float* vz,
+                            int n, float dt) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += blockDim.x*gridDim.x) {
+        px[i]+=vx[i]*dt; py[i]+=vy[i]*dt; pz[i]+=vz[i]*dt;
     }
 }
 
@@ -295,6 +386,10 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
     CUDA_CHECK(cudaMalloc(&nsize2_, fn));
     CUDA_CHECK(cudaMalloc(&nminx_,fn)); CUDA_CHECK(cudaMalloc(&nminy_,fn)); CUDA_CHECK(cudaMalloc(&nminz_,fn));
     CUDA_CHECK(cudaMalloc(&nmaxx_,fn)); CUDA_CHECK(cudaMalloc(&nmaxy_,fn)); CUDA_CHECK(cudaMalloc(&nmaxz_,fn));
+    if (p.useQuadrupole) {
+        CUDA_CHECK(cudaMalloc(&nquadA_, sizeof(float4)*capacity_));
+        CUDA_CHECK(cudaMalloc(&nquadB_, fn));
+    }
     CUDA_CHECK(cudaMalloc(&left_,  sizeof(int)*nbodies_));
     CUDA_CHECK(cudaMalloc(&right_, sizeof(int)*nbodies_));
     CUDA_CHECK(cudaMalloc(&parent_,sizeof(int)*capacity_));
@@ -317,11 +412,38 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
         return powf(lo + uni(rng)*(hi-lo), 1.0f/(1.0f-a));
     };
 
+    // Static analytic NFW dark-matter halo(s): one registered per galaxy disk
+    // (see addDisk below), applied as an external background acceleration in
+    // externalAccelKernel. Cheap (O(1)/body) way to give each galaxy a
+    // realistic DM:baryon mass ratio and flat rotation curve without doubling
+    // the N-body particle count.
+    std::vector<float> haloX,haloY,haloZ,haloMs,haloRs;
+    auto addHalo = [&](float cx,float cy,float cz,float Mgal,float Rd){
+        if (!p.haloOn || (int)haloX.size() >= MAX_HALOS) return;
+        float rs = Rd*p.haloRsFrac;
+        float m1 = logf(2.0f)-0.5f;                 // NFW mass-profile m(x=1)
+        float Ms = p.haloMassFrac*Mgal/m1;           // normalises Menc(rs) = haloMassFrac*Mgal
+        haloX.push_back(cx); haloY.push_back(cy); haloZ.push_back(cz);
+        haloMs.push_back(Ms); haloRs.push_back(rs);
+    };
+    // Halo's contribution to the enclosed mass at radius r, for circular-
+    // velocity initial conditions -- must match addHalo's (Ms,rs) exactly, or
+    // disks seeded with a live halo start out badly out of equilibrium and
+    // collapse/fly apart in the first few dynamical times.
+    auto haloMenc = [&](float r,float Mgal,float Rd) -> float {
+        if (!p.haloOn) return 0.0f;
+        float rs = Rd*p.haloRsFrac;
+        float Ms = p.haloMassFrac*Mgal/(logf(2.0f)-0.5f);
+        float xr = r/rs;
+        return Ms*(logf(1.0f+xr) - xr/(1.0f+xr));
+    };
+
     // Rotating disk galaxy into slice [s, s+cnt): centre, bulk velocity, mass,
     // radius, spin sign, and inclination (tilt about the x-axis).
     auto addDisk = [&](int s,int cnt,float cx,float cy,float cz,
                        float bvx,float bvy,float bvz,float Mgal,float Rd,
                        float spin,float inc){
+        addHalo(cx,cy,cz,Mgal,Rd);
         float Mbulge=0.25f*Mgal, ci=cosf(inc), si=sinf(inc);
         double wsum=0;
         for(int k=0;k<cnt;++k){ int i=s+k;
@@ -330,7 +452,7 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             float ang=uni(rng)*6.2831853f;
             float x=r*cosf(ang), y=r*sinf(ang);
             float th=Rd*0.05f*(uni(rng)-0.5f)*(uni(rng)-0.5f)*4.0f*expf(-r/Rd*1.5f);
-            float Menc=Mbulge+Mgal*(r*r)/(Rd*Rd);
+            float Menc=Mbulge+Mgal*(r*r)/(Rd*Rd)+haloMenc(r,Mgal,Rd);
             float vc=spin*sqrtf(G*Menc/sqrtf(r*r+eps*eps));
             float jit=0.92f+0.10f*uni(rng);
             float vx=-vc*sinf(ang)*jit, vy=vc*cosf(ang)*jit, vz=0.0f;
@@ -390,7 +512,7 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             ang += 0.10f*(uni(rng)-0.5f);          // small scatter off the ridge
             float x=r*cosf(ang), y=r*sinf(ang);
             float th=Rd*thickK*(uni(rng)-0.5f)*(uni(rng)-0.5f)*4.0f*expf(-r/Rd*1.5f);
-            float Menc=Mbulge+Mgal*(r*r)/(Rd*Rd);
+            float Menc=Mbulge+Mgal*(r*r)/(Rd*Rd)+haloMenc(r,Mgal,Rd);
             float vc=spin*sqrtf(G*Menc/sqrtf(r*r+eps*eps));
             float jit=0.97f+0.05f*uni(rng);
             float vx=-vc*sinf(ang)*jit, vy=vc*cosf(ang)*jit, vz=0.0f;
@@ -480,12 +602,37 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             // haloes (proto-galaxies) that merge hierarchically. H0 is set just
             // below the binding value so the box expands, turns around, and the
             // cosmic web condenses out of it.
-            const float R0   = 220.0f;                     // half-extent of the cube (huge box, wide spacing)
+            const float R0   = 320.0f;                     // half-extent of the cube (huge box, wide spacing)
             const float Mtot = 1.0f;                       // total (stars carry it)
+            // Hc = the H0 at which this box's actual matter density equals the
+            // critical density (Omega_m=1). Real LCDM is sub-critical in matter
+            // (Omega_m~0.3) and dominated today by dark energy (Omega_L~0.7):
+            // H0 = Hc/sqrt(Omega_m) reproduces that for the given box mass, and
+            // the Lambda term below adds the actual accelerating-expansion
+            // physics (Friedmann eq.: a'' = -GM/r^2 + Omega_L*H0^2*r) instead of
+            // just tuning H0 by hand to "looks about right".
             const float Hc   = sqrtf(2.0f*G*Mtot/(R0*R0*R0));
-            const float H0   = 0.95f*Hc;                   // near-critical: keeps expanding,
-                                                           // particles stay spread (less collapse)
+            const float H0   = Hc/sqrtf(fmaxf(p.omegaM,1e-4f));
+            lambdaTerm_ = p.omegaL*H0*H0;
             const float PI   = 3.14159265f;
+
+            // This box's dynamical times dwarf the galaxy presets': the Hubble
+            // time is 1/H0 ~ 2200 sim units and the mean-density free-fall time
+            // ~ 9000, so the default dt=8e-4 would need millions of steps before
+            // the web condenses -- it looks like "nothing forms". Tie dt to the
+            // expansion rate instead (a few thousand steps per Hubble time),
+            // unless the user pinned it with --dt.
+            if (!p.dtGiven) p_.dt = 1.0f/(3600.0f*H0);
+            // Likewise soften to a fraction of the mean interparticle spacing
+            // (~6 units at 1M bodies in a 640-unit box). The galaxy-scale
+            // eps=0.004 is ~1000x too hard here: collapsed knots would two-body
+            // scatter and evaporate instead of surviving as haloes/proto-galaxies.
+            {
+                float spacing = 2.0f*R0/cbrtf((float)(nS>0?nS:1));
+                p_.eps = 0.08f*spacing;
+            }
+            std::printf("Big Bang: H0=%.3e  dt=%.3f (%s)  eps=%.3f  (t_H ~ %.0f sim units)\n",
+                H0, p_.dt, p.dtGiven?"--dt":"auto", p_.eps, 1.0f/H0);
 
             // --- Gaussian random displacement field with a ΛCDM-like P(k) ---
             // Real cosmic-web structure spans many scales: huge voids bounded by
@@ -494,10 +641,20 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             // so we sum many modes log-sampled across a decade of wavenumber with
             // a red-tilted, small-scale-damped spectrum (more power on large
             // scales, gently cut at small scales like the CDM transfer function).
-            const int   NM   = 48;
-            const float kmin = PI / R0;                    // ~box scale (wavelength 2*R0)
-            const float kmax = 9.0f * kmin;               // finest resolved filaments
-            const float kcut = 6.0f * kmin;               // small-scale damping knee
+            // NM modes log-spaced across a WIDE range of scales: too narrow a
+            // range (or too steep a tilt) lets the single box-fundamental mode
+            // dominate, which renders as one giant X-shaped filament crossing
+            // the whole box instead of a proper tiled web of many voids/cells
+            // (like a slice through a real cosmological box). Starting above
+            // the fundamental and using a shallower tilt (k^-0.7 instead of
+            // k^-1) spreads the power across several octaves so dozens of
+            // independent voids/filaments/knots form across the volume.
+            const int   NM     = 96;
+            const float kfund  = PI / R0;                  // box fundamental (wavelength 2*R0)
+            const float kmin   = 1.4f * kfund;              // mildly suppress the single global mode
+            const float kmax   = 14.0f * kfund;             // fine filament/knot scale
+            const float kcut   = 9.0f * kfund;              // small-scale damping knee
+            const float tilt   = 0.9f;                      // spectral slope amp ~ k^-tilt
             float kx[NM],ky[NM],kz[NM],amp[NM],ph[NM],kl[NM];
             float sumA2 = 0.0f;
             for(int m=0;m<NM;++m){
@@ -507,10 +664,10 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
                 // log-uniform |k| -> even coverage of every scale
                 float kmag=kmin*powf(kmax/kmin, uni(rng));
                 kx[m]=dx/dl*kmag; ky[m]=dy/dl*kmag; kz[m]=dz/dl*kmag; kl[m]=kmag;
-                // red spectrum (~1/k) with a Gaussian small-scale cutoff + random
+                // red spectrum with a Gaussian small-scale cutoff + random
                 // mode-to-mode amplitude scatter (Rayleigh-ish) for irregularity
                 float damp = expf(-(kmag*kmag)/(kcut*kcut));
-                float a = (kmin/kmag) * damp * (0.5f + uni(rng));
+                float a = powf(kmin/kmag, tilt) * damp * (0.5f + uni(rng));
                 amp[m]=a; sumA2 += a*a;
                 ph[m]=uni(rng)*6.2831853f;
             }
@@ -520,7 +677,13 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             const float targetRMS = 0.24f * R0;            // structure strength
             float gscale = (sumA2>1e-12f) ? targetRMS/sqrtf(0.5f*sumA2) : 0.0f;
             for(int m=0;m<NM;++m) amp[m]*=gscale;
-            const float vpec = 0.50f;                      // growing-mode velocity coupling
+            // Zel'dovich growing mode: v_pec = f*H0*d, with the linear growth
+            // rate f = dlnD/dlna ~ Omega_m^0.55. The coupling has units of
+            // 1/time (it multiplies a displacement), so it MUST scale with H0
+            // (~4.5e-4 here) -- a hard-coded O(1) value gives peculiar speeds
+            // hundreds of times the escape speed and free-streams the box into
+            // a structureless haze instead of letting the web grow.
+            const float vpec = powf(fmaxf(p.omegaM,1e-4f),0.55f)*H0;
 
             auto seedBB=[&](int s,int cnt,float mPart){
                 for(int k=0;k<cnt;++k){ int i=s+k;
@@ -563,6 +726,22 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
     CUDA_CHECK(cudaMemcpy(velz_,hvz.data(),fb,cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(mass_,hm.data(),fb,cudaMemcpyHostToDevice));
     worldRadius_ = 1.2f;
+
+    // Upload the static halo table + cosmological Lambda term to constant memory.
+    int haloCount = (int)haloX.size();
+    CUDA_CHECK(cudaMemcpyToSymbol(d_haloCount, &haloCount, sizeof(int)));
+    if (haloCount > 0) {
+        CUDA_CHECK(cudaMemcpyToSymbol(d_haloX, haloX.data(), sizeof(float)*haloCount));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_haloY, haloY.data(), sizeof(float)*haloCount));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_haloZ, haloZ.data(), sizeof(float)*haloCount));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_haloMs, haloMs.data(), sizeof(float)*haloCount));
+        CUDA_CHECK(cudaMemcpyToSymbol(d_haloRs, haloRs.data(), sizeof(float)*haloCount));
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(d_lambdaTerm, &lambdaTerm_, sizeof(float)));
+
+    // Prime accx_/accy_/accz_ with a(t0) so step()'s leapfrog kick-drift-kick
+    // has a valid initial half-kick on the very first call.
+    buildTree(); summarize(); computeForces(); applyExternalForces();
 }
 
 Simulation::~Simulation() {
@@ -573,6 +752,7 @@ Simulation::~Simulation() {
     cudaFree(ncom_);cudaFree(nsize2_);
     cudaFree(nminx_);cudaFree(nminy_);cudaFree(nminz_);
     cudaFree(nmaxx_);cudaFree(nmaxy_);cudaFree(nmaxz_);
+    if (nquadA_) { cudaFree(nquadA_); cudaFree(nquadB_); }
     cudaFree(left_);cudaFree(right_);cudaFree(parent_);cudaFree(visited_);
     cudaFree(code_);cudaFree(idx_);
 }
@@ -599,27 +779,43 @@ void Simulation::buildTree() {
 
     buildTreeKernel<<<gn,BLOCK>>>(code_,nbodies_,left_,right_,parent_);
     initLeavesKernel<<<gn,BLOCK>>>(posx_,posy_,posz_,mass_,idx_,nbodies_,
-        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
+        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,nquadA_,nquadB_,visited_);
 }
 
 void Simulation::summarize() {
     summarizeKernel<<<grid(nbodies_),BLOCK>>>(parent_,left_,right_,nbodies_,
-        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
+        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,nquadA_,nquadB_,visited_);
+}
+
+void Simulation::computeForces() {
+    forcesKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,idx_,left_,right_,
+        ncom_,nsize2_,nquadA_,nquadB_,accx_,accy_,accz_,
+        nbodies_,p_.theta,p_.eps*p_.eps,p_.G,p_.useQuadrupole);
+}
+
+void Simulation::applyExternalForces() {
+    externalAccelKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,accx_,accy_,accz_,nbodies_,p_.G);
 }
 
 void Simulation::computeAccelOnly() {
+    // Pure N-body tree force (no halo/Lambda) -- used for diagnostics/--verify,
+    // where we compare against an exact O(N^2) N-body reference.
     buildTree(); summarize();
-    forcesKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,idx_,left_,right_,
-        ncom_,nsize2_,accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
+    computeForces();
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void Simulation::step() {
+    // Leapfrog kick-drift-kick: accx_/accy_/accz_ already hold a(t) from the
+    // end of the previous step (or the constructor's initial force eval).
+    float dtHalf = 0.5f*p_.dt;
+    float dampHalf = sqrtf(p_.damping);
+    kickKernel<<<grid(nbodies_),BLOCK>>>(velx_,vely_,velz_,accx_,accy_,accz_,nbodies_,dtHalf,dampHalf);
+    driftKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,velx_,vely_,velz_,nbodies_,p_.dt);
     buildTree(); summarize();
-    forcesKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,idx_,left_,right_,
-        ncom_,nsize2_,accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
-    integrateKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,velx_,vely_,velz_,
-        accx_,accy_,accz_,nbodies_,p_.dt,p_.damping);
+    computeForces();
+    applyExternalForces();          // a(t+dt) now includes halo(s) + Lambda term
+    kickKernel<<<grid(nbodies_),BLOCK>>>(velx_,vely_,velz_,accx_,accy_,accz_,nbodies_,dtHalf,dampHalf);
 }
 
 void Simulation::copyToRenderBuffer(float* d_dst) {
@@ -649,6 +845,18 @@ void Simulation::accelError(const float* d_refx, const float* d_refy, const floa
         double rel=err/mag; sum+=rel; if(rel>maxRelErr)maxRelErr=rel;
     }
     meanRelErr=sum/nbodies_;
+}
+
+void Simulation::dumpPositions(const char* path) {
+    std::vector<float> x(nbodies_),y(nbodies_),z(nbodies_);
+    CUDA_CHECK(cudaMemcpy(x.data(),posx_,sizeof(float)*nbodies_,cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(y.data(),posy_,sizeof(float)*nbodies_,cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(z.data(),posz_,sizeof(float)*nbodies_,cudaMemcpyDeviceToHost));
+    FILE* f = std::fopen(path,"w");
+    if(!f){ std::fprintf(stderr,"dump: cannot open %s\n",path); return; }
+    for(int i=0;i<nbodies_;++i) std::fprintf(f,"%g %g %g\n",x[i],y[i],z[i]);
+    std::fclose(f);
+    std::printf("dumped %d positions -> %s\n", nbodies_, path);
 }
 
 double Simulation::totalEnergy() {

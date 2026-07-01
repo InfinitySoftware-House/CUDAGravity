@@ -6,7 +6,8 @@
 //   gravity --verify        compare Barnes-Hut accel against brute force O(N^2)
 //
 // Viewer controls:
-//   left-drag orbit, scroll zoom, R reset, Space pause, A auto-spin,
+//   left-drag look, right-drag orbit centre of mass, scroll zoom, R reset,
+//   Space pause, A auto-spin,
 //   V toggle velocity colouring (blue=slow -> red=fast), C record video, Esc quit.
 //
 // Rendering: stars are drawn as additive sprites into an HDR (RGBA16F) buffer,
@@ -39,10 +40,11 @@ static void onTermSignal(int){ g_quitRequested = 1; }
 // ---------------------------------------------------------------------------
 //  Headless modes (no OpenGL needed)
 // ---------------------------------------------------------------------------
-static int runBench(SimParams p, int steps) {
+static int runBench(SimParams p, int steps, const std::string& dumpPath) {
     std::printf("Benchmark: %d bodies, %d steps (theta=%.2f)\n", p.n, steps, p.theta);
     Simulation sim(p);
     cudaDeviceSynchronize();
+    if(!dumpPath.empty()) sim.dumpPositions((dumpPath + ".t0.txt").c_str());
     for (int i = 0; i < 5; ++i) sim.step();
     cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -53,6 +55,7 @@ static int runBench(SimParams p, int steps) {
     double msPer = ms / steps;
     std::printf("Total %.1f ms  ->  %.3f ms/step  =  %.1f FPS\n", ms, msPer, 1000.0/msPer);
     std::printf("Throughput: %.1f million body-steps/sec\n", (double)p.n*steps/(ms/1000.0)/1e6);
+    if(!dumpPath.empty()) sim.dumpPositions((dumpPath + ".t1.txt").c_str());
     return 0;
 }
 static int runVerify(SimParams p) {
@@ -103,7 +106,7 @@ static Mat4 lookAt(float ex,float ey,float ez,float cx,float cy,float cz,float u
 // incrementally about the camera's own axes -> full 360 freedom, no gimbal lock.
 static float g_camPos[3]={1.6f,1.3f,2.2f};
 static float g_f[3]={0,0,-1}, g_r[3]={1,0,0}, g_u[3]={0,1,0};
-static bool  g_dragging=false, g_paused=false, g_autospin=false;
+static bool  g_dragging=false, g_rDragging=false, g_paused=false, g_autospin=false;
 static int   g_mode=0;                 // 0 = realistic, 1 = velocity
 static bool  g_toggleRecord=false;     // edge flag set by key
 static int   g_preset=1;               // active IC template (1..6)
@@ -112,7 +115,7 @@ static bool  g_clouds=true;            // render ambient nebulae + dust
 static bool  g_orbit=false;            // auto-orbit the centre of mass
 static float g_orbAz=0.0f, g_orbEl=0.35f, g_orbR=4.0f;   // orbit angle/elev/radius
 static float g_orbSpeed=0.0015f;       // radians per frame
-static double g_lastX=0, g_lastY=0;
+static double g_lastX=0, g_lastY=0, g_lastRX=0, g_lastRY=0;
 
 static void vnorm(float*v){ float l=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(l>1e-8f){v[0]/=l;v[1]/=l;v[2]/=l;} }
 static void vcross(const float*a,const float*b,float*o){ o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0]; }
@@ -123,9 +126,11 @@ static void vrot(float*v,const float*k,float ang){
     for(int i=0;i<3;++i) v[i]=v[i]*c + cx[i]*s + k[i]*kv*(1.0f-c);
 }
 static void camReset(){
-    // Big Bang fills a huge cube (half-extent R0=220) far larger than the galaxy
-    // presets, so start the camera further back to frame the whole box.
-    float d = (g_preset==7) ? 540.0f : 1.0f;
+    // Big Bang fills a huge cube (half-extent R0=320, barnes_hut.cu) far larger
+    // than the galaxy presets. Distance chosen to frame the box edge-to-edge at
+    // the ~57deg vertical FOV used below (R0/tan(fovy/2) ~= 1.83*R0), with some
+    // margin for particles displaced past the edge by the initial perturbation.
+    float d = (g_preset==7) ? 260.0f : 1.0f;
     g_camPos[0]=1.6f*d; g_camPos[1]=1.3f*d; g_camPos[2]=2.2f*d;
     float f[3]={-g_camPos[0],-g_camPos[1],-g_camPos[2]}; vnorm(f);
     float wup[3]={0,1,0}, r[3]; vcross(f,wup,r); vnorm(r);
@@ -133,18 +138,30 @@ static void camReset(){
     for(int i=0;i<3;++i){ g_f[i]=f[i]; g_r[i]=r[i]; g_u[i]=u[i]; }
 }
 
-static void onMouseButton(GLFWwindow*w,int b,int act,int){ if(b==GLFW_MOUSE_BUTTON_LEFT){ g_dragging=(act==GLFW_PRESS); glfwGetCursorPos(w,&g_lastX,&g_lastY);} }
-static void onCursor(GLFWwindow*,double x,double y){
-    if(!g_dragging){ g_lastX=x; g_lastY=y; return; }
-    float dx=(float)(x-g_lastX), dy=(float)(y-g_lastY);
-    g_lastX=x; g_lastY=y;
-    const float sens=0.005f;                       // drag-to-look (no pitch clamp)
-    vrot(g_f,g_u,-dx*sens); vrot(g_r,g_u,-dx*sens);
-    vrot(g_f,g_r,-dy*sens); vrot(g_u,g_r,-dy*sens);
-    vnorm(g_f); vnorm(g_r); vnorm(g_u);
+static void onMouseButton(GLFWwindow*w,int b,int act,int){
+    if(b==GLFW_MOUSE_BUTTON_LEFT){ g_dragging=(act==GLFW_PRESS); glfwGetCursorPos(w,&g_lastX,&g_lastY); }
+    if(b==GLFW_MOUSE_BUTTON_RIGHT){ g_rDragging=(act==GLFW_PRESS); glfwGetCursorPos(w,&g_lastRX,&g_lastRY); }
 }
-static void onScroll(GLFWwindow*,double,double dy){      // dolly along view direction
-    for(int i=0;i<3;++i) g_camPos[i]+=g_f[i]*(float)dy*0.15f;
+static void onCursor(GLFWwindow*,double x,double y){
+    if(g_dragging){
+        float dx=(float)(x-g_lastX), dy=(float)(y-g_lastY);
+        g_lastX=x; g_lastY=y;
+        const float sens=0.005f;                       // drag-to-look (no pitch clamp)
+        vrot(g_f,g_u,-dx*sens); vrot(g_r,g_u,-dx*sens);
+        vrot(g_f,g_r,-dy*sens); vrot(g_u,g_r,-dy*sens);
+        vnorm(g_f); vnorm(g_r); vnorm(g_u);
+    } else { g_lastX=x; g_lastY=y; }
+    if(g_rDragging){
+        float dx=(float)(x-g_lastRX), dy=(float)(y-g_lastRY);
+        g_lastRX=x; g_lastRY=y;
+        const float sens=0.005f;                       // right-drag orbits centre of mass
+        g_orbAz -= dx*sens;
+        g_orbEl  = std::max(-1.5f, std::min(1.5f, g_orbEl - dy*sens));
+    } else { g_lastRX=x; g_lastRY=y; }
+}
+static void onScroll(GLFWwindow*,double,double dy){      // dolly along view direction / orbit radius
+    if(g_orbit || g_rDragging){ g_orbR -= (float)dy*0.15f; if(g_orbR<0.05f) g_orbR=0.05f; }
+    else for(int i=0;i<3;++i) g_camPos[i]+=g_f[i]*(float)dy*0.15f;
 }
 static void onKey(GLFWwindow*w,int key,int,int act,int){ if(act!=GLFW_PRESS)return;
     if(key==GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w,1);
@@ -206,12 +223,13 @@ void main(){
 static const char* kStarFrag = R"(#version 330 core
 in vec3 vColor; in float vBright;
 out vec4 FragColor;
+uniform float uHaloAmt;   // dial the soft halo down for dense point clouds (cosmic web) so voids stay dark
 void main(){
     vec2 d = gl_PointCoord - vec2(0.5);
     float r2 = dot(d,d);
     if(r2 > 0.25) discard;
     float core = exp(-r2 * 22.0);          // tight bright core
-    float halo = exp(-r2 * 6.0) * 0.06;     // faint surrounding glow
+    float halo = exp(-r2 * 6.0) * 0.06 * uHaloAmt;  // faint surrounding glow
     float a = core + halo;
     FragColor = vec4(vColor * vBright * a * 1.1, a);   // HDR, additive
 }
@@ -398,7 +416,8 @@ static void buildCloudAttrs(int nStars,int nGas,int nDust, std::vector<float>& a
 
 static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
                      bool autoRecord, int autoRecFrames,
-                     bool headless, int recFps, int subSteps,
+                     bool headless, int recFps, int subSteps, bool subStepsGiven,
+                     bool thetaGiven, bool quadGiven, float origTheta, bool origQuad,
                      int capW, int capH, int recCrf, bool orbitOn) {
     if(!glfwInit()){ std::fprintf(stderr,"glfwInit failed\n"); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
@@ -434,11 +453,15 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
 
     GLuint fsVao; glGenVertexArrays(1,&fsVao);     // empty VAO for fullscreen passes
 
-    // Per-preset particle budget. Big Bang runs at 1M with no nebulae (pure
-    // gravitational structure formation); the others use the CLI star count
-    // (default 100k) plus gas/dust fractions.
+    // Per-preset particle budget. Big Bang has no nebulae (pure gravitational
+    // structure formation) and needs ~thousands of steps to grow the web, so
+    // its default body count is kept low enough to hit interactive real-time
+    // rates -- 1M was ~10x more particles than the other presets and made
+    // each of those thousands of steps take 100+ ms, hence the 20 min wait.
+    // 250k still resolves voids/filaments/haloes at the same box scale, just
+    // with coarser per-halo sampling; --n= raises it back up if you want more.
     auto countsFor=[&](int preset,int& ns,int& ng,int& nd){
-        if(preset==7){ ns=(cliN>0?cliN:1000000); ng=0; nd=0; }
+        if(preset==7){ ns=(cliN>0?cliN:250000); ng=0; nd=0; }
         else { ns=(cliN>0?cliN:100000);
                ng=(cliGas>=0?cliGas:ns/16); nd=(cliDust>=0?cliDust:ns/10); }
         if(ns<2) ns=2;
@@ -516,7 +539,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
     Simulation* sim = new Simulation(p);
     g_preset = p.preset;
     std::printf("Viewer: %d stars + %d gas + %d dust = %d bodies.\n"
-        "  drag look | WASD move | Q/E down-up | Shift faster | scroll dolly | Space pause\n"
+        "  L-drag look | R-drag orbit COM | WASD move | Q/E down-up | Shift faster | scroll dolly/zoom | Space pause\n"
         "  V velocity | X auto-spin | N nebulae/dust | O orbit COM | C record | R reset cam | Esc quit\n"
         "  presets: 1 spiral  2 collision  3 minor-merger  4 collapse  5 explosion  6 head-on  7 BIG BANG(1M)\n",
         nStars,nGas,nDust,total);
@@ -549,6 +572,9 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         if(g_restart){
             g_restart=false;
             p.preset=g_preset;
+            if(!subStepsGiven) subSteps = (p.preset==7) ? 8 : 1;   // Big Bang needs many steps/frame to see structure grow
+            p.theta = (!thetaGiven && p.preset==7) ? 0.9f : origTheta;
+            p.useQuadrupole = (!quadGiven && p.preset==7) ? false : origQuad;
             int ns,ng,nd; countsFor(p.preset,ns,ng,nd);
             if(ns!=nStars||ng!=nGas||nd!=nDust){ buildBodyBuffers(ns,ng,nd); camReset(); }
             p.n=nStars; p.nGas=nGas; p.nDust=nDust;
@@ -615,16 +641,17 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         if(glfwGetKey(win,GLFW_KEY_Q)==GLFW_PRESS) moveCam(g_u,-spd);
         if(g_autospin){ vrot(g_f,g_u,0.0007f); vrot(g_r,g_u,0.0007f); }
 
-        // --- auto-orbit the centre of mass (O / --orbit) ---
+        // --- orbit the centre of mass: auto (O / --orbit) or manual (right-drag) ---
         sim->centerOfMass(com[0],com[1],com[2]);
-        if(g_orbit){
+        bool orbiting = g_orbit || g_rDragging;
+        if(orbiting){
             if(!orbitPrev){                                   // seed from current view (no jump)
                 float dx=g_camPos[0]-com[0], dy=g_camPos[1]-com[1], dz=g_camPos[2]-com[2];
                 g_orbR=std::sqrt(dx*dx+dy*dy+dz*dz); if(g_orbR<0.2f) g_orbR=0.2f;
                 g_orbAz=std::atan2(dz,dx);
                 g_orbEl=std::asin(std::max(-0.99f,std::min(0.99f,dy/g_orbR)));
             }
-            g_orbAz += g_orbSpeed;
+            if(g_orbit) g_orbAz += g_orbSpeed;
             float ce=std::cos(g_orbEl), se=std::sin(g_orbEl);
             g_camPos[0]=com[0]+g_orbR*std::cos(g_orbAz)*ce;
             g_camPos[1]=com[1]+g_orbR*se;
@@ -634,7 +661,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
             float u[3]; vcross(r,f,u);
             for(int i=0;i<3;++i){ g_f[i]=f[i]; g_r[i]=r[i]; g_u[i]=u[i]; }
         }
-        orbitPrev=g_orbit;
+        orbitPrev=orbiting;
 
         float camDist=std::sqrt(g_camPos[0]*g_camPos[0]+g_camPos[1]*g_camPos[1]+g_camPos[2]*g_camPos[2]);
         float ctr[3]={g_camPos[0]+g_f[0], g_camPos[1]+g_f[1], g_camPos[2]+g_f[2]};
@@ -686,9 +713,14 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         glEnable(GL_BLEND); glBlendFunc(GL_ONE,GL_ONE);
         glUseProgram(progStars);
         glUniformMatrix4fv(glGetUniformLocation(progStars,"uMVP"),1,GL_FALSE,mvp.m);
-        glUniform1f(glGetUniformLocation(progStars,"uPointScale"),(float)rh*0.0022f*fmaxf(camDist,0.3f));
+        // Big Bang (7): 1M points along deep cosmic-web sightlines add up fast;
+        // smaller sprites keep filaments thin and voids dark instead of every
+        // point's halo overlapping into a uniform haze.
+        glUniform1f(glGetUniformLocation(progStars,"uPointScale"),
+            (float)rh*0.0022f*fmaxf(camDist,0.3f) * (g_preset==7 ? 0.7f : 1.0f));
         glUniform1i(glGetUniformLocation(progStars,"uMode"),g_mode);
         glUniform1f(glGetUniformLocation(progStars,"uSpeedScale"),0.45f);
+        glUniform1f(glGetUniformLocation(progStars,"uHaloAmt"), g_preset==7 ? 0.6f : 1.0f);
         glBindVertexArray(starVao);
         glDrawArrays(GL_POINTS,0,nStars);
 
@@ -802,8 +834,11 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
 // ---------------------------------------------------------------------------
 int main(int argc,char** argv){
     SimParams p; enum { VIEW, BENCH, VERIFY } mode=VIEW; int steps=200;
+    std::string dumpPath;                       // --dump=path: bench writes positions at t0/t1
     bool autoRecord=false; int autoRecFrames=0;
     bool headless=false; int recFps=60, subSteps=1;
+    bool subStepsGiven=false;                   // --substeps pins it; else preset 7 defaults faster
+    bool thetaGiven=false, quadGiven=false;      // --theta/--noquad/--quad pin these; else preset 7 defaults looser (opening-angle tree approximation, not the force law)
     int capW=1920, capH=1080, recCrf=18; bool orbitOn=false;
     int nArg=-1, gasArg=-1, dustArg=-1;        // <0 -> use per-preset default
     bool seedGiven=false;                       // --seed pins the IC; else randomize
@@ -816,7 +851,7 @@ int main(int argc,char** argv){
         else if(a=="--nogas"){ gasArg=0; dustArg=0; }
         else if(a.rfind("--recframes=",0)==0){ autoRecord=true; autoRecFrames=std::atoi(a.c_str()+12); }
         else if(a.rfind("--fps=",0)==0)   recFps=std::atoi(a.c_str()+6);
-        else if(a.rfind("--substeps=",0)==0) subSteps=std::atoi(a.c_str()+11);
+        else if(a.rfind("--substeps=",0)==0){ subSteps=std::atoi(a.c_str()+11); subStepsGiven=true; }
         else if(a.rfind("--width=",0)==0) capW=std::atoi(a.c_str()+8);
         else if(a.rfind("--height=",0)==0)capH=std::atoi(a.c_str()+9);
         else if(a.rfind("--crf=",0)==0)   recCrf=std::atoi(a.c_str()+6);
@@ -825,12 +860,43 @@ int main(int argc,char** argv){
         else if(a.rfind("--dust=",0)==0)  dustArg=std::atoi(a.c_str()+7);
         else if(a.rfind("--preset=",0)==0)p.preset=std::atoi(a.c_str()+9);
         else if(a.rfind("--steps=",0)==0) steps=std::atoi(a.c_str()+8);
-        else if(a.rfind("--theta=",0)==0) p.theta=(float)std::atof(a.c_str()+8);
-        else if(a.rfind("--dt=",0)==0)    p.dt=(float)std::atof(a.c_str()+5);
+        else if(a.rfind("--dump=",0)==0)  dumpPath=a.substr(7);
+        else if(a.rfind("--theta=",0)==0){ p.theta=(float)std::atof(a.c_str()+8); thetaGiven=true; }
+        else if(a.rfind("--dt=",0)==0){   p.dt=(float)std::atof(a.c_str()+5); p.dtGiven=true; }
         else if(a.rfind("--seed=",0)==0){ p.seed=(uint32_t)std::strtoul(a.c_str()+7,nullptr,10); seedGiven=true; }
+        else if(a=="--noquad"){           p.useQuadrupole=false; quadGiven=true; }
+        else if(a=="--quad"){             p.useQuadrupole=true;  quadGiven=true; }
+        else if(a=="--nohalo")            p.haloOn=false;
+        else if(a.rfind("--halofrac=",0)==0) p.haloMassFrac=(float)std::atof(a.c_str()+11);
+        else if(a.rfind("--halors=",0)==0)   p.haloRsFrac=(float)std::atof(a.c_str()+9);
+        else if(a.rfind("--omegam=",0)==0)   p.omegaM=(float)std::atof(a.c_str()+9);
+        else if(a.rfind("--omegal=",0)==0)   p.omegaL=(float)std::atof(a.c_str()+9);
         else { std::fprintf(stderr,"unknown arg: %s\n",a.c_str()); return 1; } }
     if(nArg>=0) p.n=nArg;
     if(p.n<2) p.n=2;
+    // Big Bang: cosmic structure grows over ~thousands of steps (t_H ~ 2200 sim
+    // units / dt ~ 0.6 -> ~3600 steps per Hubble time). At 1 step/frame that is
+    // minutes of real time before anything visible forms, so run several steps
+    // per rendered frame by default -- unless the user already asked for a
+    // specific rate with --substeps.
+    if(!subStepsGiven && p.preset==7) subSteps=8;
+    // Cosmic-web scale gravity tolerates a looser Barnes-Hut opening angle and
+    // monopole-only nodes far better than a compact disk galaxy does (the
+    // structures being resolved -- voids/filaments/haloes -- are huge and
+    // diffuse compared to theta*distance at any relevant range). Both are
+    // approximation dials of the tree, not the physics: same Newtonian force
+    // law, same integrator, same dt/eps. This roughly halves cost/step on top
+    // of the particle-count cut above.
+    const float origTheta = p.theta;             // user-pinned (--theta) or struct default
+    const bool  origQuad  = p.useQuadrupole;      // user-pinned (--quad/--noquad) or struct default
+    if(!thetaGiven && p.preset==7) p.theta = 0.9f;
+    if(!quadGiven  && p.preset==7) p.useQuadrupole = false;
+    std::printf("Physics: leapfrog KDK, Barnes-Hut %s, %s NFW halo (DM:baryon=%.1f:1, rs=%.1fxRd), "
+        "cosmology Omega_m=%.2f/Omega_L=%.2f\n",
+        p.useQuadrupole?"monopole+quadrupole":"monopole",
+        p.haloOn?"on":"off", p.haloMassFrac, p.haloRsFrac, p.omegaM, p.omegaL);
+    std::printf("Units: 1 length = %.0f kpc, 1 mass = %.0e Msun, 1 velocity = %.1f km/s, 1 time = %.2f Myr\n",
+        units::kLengthKpc, units::kMassMsun, units::velocityKms(), units::timeMyr());
     // Fresh randomness each run unless the user pins it with --seed=N. The seed is
     // printed so any run you like can be reproduced exactly later.
     if(!seedGiven){ std::random_device rd; p.seed=((uint32_t)rd()<<1)^(uint32_t)std::time(nullptr); }
@@ -838,7 +904,9 @@ int main(int argc,char** argv){
     else          std::printf("seed = %u (random; pass --seed=%u to reproduce this run)\n", p.seed, p.seed);
     // bench/verify stay pure-star (numbers comparable); the viewer picks the
     // star/gas/dust counts per preset (see countsFor in runViewer).
-    switch(mode){ case BENCH: return runBench(p,steps); case VERIFY: return runVerify(p);
+    switch(mode){ case BENCH: return runBench(p,steps,dumpPath); case VERIFY: return runVerify(p);
                   default: return runViewer(p,nArg,gasArg,dustArg,autoRecord,autoRecFrames,
-                                            headless,recFps,subSteps,capW,capH,recCrf,orbitOn); }
+                                            headless,recFps,subSteps,subStepsGiven,
+                                            thetaGiven,quadGiven,origTheta,origQuad,
+                                            capW,capH,recCrf,orbitOn); }
 }

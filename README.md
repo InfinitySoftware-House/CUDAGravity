@@ -7,6 +7,10 @@ rendered live through **CUDA↔OpenGL interop** as additively-blended point spri
 
 Handles 100k particles in real time and scales to millions.
 
+## Demo
+
+<video src="media/demo.mp4" controls width="800"></video>
+
 ## Measured on an RTX 5060 (sm_120), θ=0.5
 
 | Bodies | ms/step | FPS (compute) |
@@ -83,8 +87,9 @@ Extra flags: `--steps=N`, `--theta=0.6`, `--dt=0.0008`, `--gas=N`, `--dust=N`,
 ### Viewer controls
 Free-fly camera — full 360° look, no gimbal lock.
 - **Left-drag** — look around
+- **Right-drag** — orbit the camera around the centre of mass
 - **WASD** — move (forward/left/back/right), **Q/E** — down/up
-- **Shift** — move faster · **Scroll** — dolly forward/back
+- **Shift** — move faster · **Scroll** — dolly forward/back (orbit radius while orbiting)
 - **Space** — pause
 - **X** — toggle auto-spin
 - **V** — toggle velocity colouring (blue = slow → red = fast)
