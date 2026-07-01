@@ -158,7 +158,7 @@ __global__ void buildTreeKernel(const unsigned* code, int n,
 // ----- bottom-up centre of mass + AABB (lock-free) ------------------------
 __global__ void initLeavesKernel(const float* px, const float* py, const float* pz,
                                  const float* mass, const int* idx, int n,
-                                 float* nm, float* ncx, float* ncy, float* ncz,
+                                 float4* ncom, float* nsize2,
                                  float* nminx, float* nminy, float* nminz,
                                  float* nmaxx, float* nmaxy, float* nmaxz,
                                  int* visited) {
@@ -166,7 +166,8 @@ __global__ void initLeavesKernel(const float* px, const float* py, const float* 
         int node = (n-1) + p;
         int b = idx[p];
         float x=px[b], y=py[b], z=pz[b], m=mass[b];
-        nm[node]=m; ncx[node]=x; ncy[node]=y; ncz[node]=z;
+        ncom[node]=make_float4(x,y,z,m);
+        nsize2[node]=0.0f;               // leaf has no extent
         nminx[node]=nmaxx[node]=x;
         nminy[node]=nmaxy[node]=y;
         nminz[node]=nmaxz[node]=z;
@@ -174,7 +175,7 @@ __global__ void initLeavesKernel(const float* px, const float* py, const float* 
     }
 }
 __global__ void summarizeKernel(const int* parent, const int* left, const int* right,
-                                int n, float* nm, float* ncx, float* ncy, float* ncz,
+                                int n, float4* ncom, float* nsize2,
                                 float* nminx, float* nminy, float* nminz,
                                 float* nmaxx, float* nmaxy, float* nmaxz,
                                 int* visited) {
@@ -184,18 +185,18 @@ __global__ void summarizeKernel(const int* parent, const int* left, const int* r
         while (cur != -1) {
             if (atomicAdd(&visited[cur], 1) == 0) break;   // first child waits
             int a = left[cur], b = right[cur];
-            float ma = nm[a], mb = nm[b], m = ma + mb;
+            float4 ca = ncom[a], cb = ncom[b];
+            float ma = ca.w, mb = cb.w, m = ma + mb;
             float inv = (m > 0.0f) ? 1.0f/m : 0.0f;
-            ncx[cur] = (ma*ncx[a] + mb*ncx[b]) * inv;
-            ncy[cur] = (ma*ncy[a] + mb*ncy[b]) * inv;
-            ncz[cur] = (ma*ncz[a] + mb*ncz[b]) * inv;
-            nminx[cur] = fminf(nminx[a], nminx[b]);
-            nminy[cur] = fminf(nminy[a], nminy[b]);
-            nminz[cur] = fminf(nminz[a], nminz[b]);
-            nmaxx[cur] = fmaxf(nmaxx[a], nmaxx[b]);
-            nmaxy[cur] = fmaxf(nmaxy[a], nmaxy[b]);
-            nmaxz[cur] = fmaxf(nmaxz[a], nmaxz[b]);
-            nm[cur] = m;
+            ncom[cur] = make_float4((ma*ca.x + mb*cb.x) * inv,
+                                    (ma*ca.y + mb*cb.y) * inv,
+                                    (ma*ca.z + mb*cb.z) * inv, m);
+            float mnx=fminf(nminx[a],nminx[b]), mny=fminf(nminy[a],nminy[b]), mnz=fminf(nminz[a],nminz[b]);
+            float mxx=fmaxf(nmaxx[a],nmaxx[b]), mxy=fmaxf(nmaxy[a],nmaxy[b]), mxz=fmaxf(nmaxz[a],nmaxz[b]);
+            nminx[cur]=mnx; nminy[cur]=mny; nminz[cur]=mnz;
+            nmaxx[cur]=mxx; nmaxy[cur]=mxy; nmaxz[cur]=mxz;
+            float s = fmaxf(mxx-mnx, fmaxf(mxy-mny, mxz-mnz));
+            nsize2[cur] = s*s;             // precompute size^2 -> forces read 1 float
             __threadfence();
             if (cur == 0) break;
             cur = parent[cur];
@@ -206,9 +207,7 @@ __global__ void summarizeKernel(const int* parent, const int* left, const int* r
 // ----- force calculation --------------------------------------------------
 __global__ void forcesKernel(const float* px, const float* py, const float* pz,
                              const int* idx, const int* left, const int* right,
-                             const float* nm, const float* ncx, const float* ncy, const float* ncz,
-                             const float* nminx, const float* nminy, const float* nminz,
-                             const float* nmaxx, const float* nmaxy, const float* nmaxz,
+                             const float4* __restrict__ ncom, const float* __restrict__ nsize2,
                              float* ax, float* ay, float* az,
                              int n, float theta, float eps2, float G) {
     const float theta2 = theta*theta;
@@ -223,26 +222,21 @@ __global__ void forcesKernel(const float* px, const float* py, const float* pz,
         int sp = 0; stack[sp++] = 0;          // root internal node
         while (sp > 0) {
             int node = stack[--sp];
-            if (node >= n-1) {                // leaf
-                int b = idx[node-(n-1)];
-                if (b == i) continue;
-                float dx=px[b]-bx, dy=py[b]-by, dz=pz[b]-bz;
-                float r2 = dx*dx+dy*dy+dz*dz+eps2;
+            // One packed load covers both COM (xyz) and mass (w) for any node.
+            float4 c = ncom[node];
+            float dx=c.x-bx, dy=c.y-by, dz=c.z-bz;
+            float r2 = dx*dx+dy*dy+dz*dz+eps2;
+            if (node >= n-1) {                // leaf: c.xyz is the body, c.w its mass
+                if (idx[node-(n-1)] == i) continue;
                 float inv = rsqrtf(r2);
-                float f = G*nm[node]*inv*inv*inv;
+                float f = G*c.w*inv*inv*inv;
                 fx+=f*dx; fy+=f*dy; fz+=f*dz;
-            } else {                          // internal
-                float dx=ncx[node]-bx, dy=ncy[node]-by, dz=ncz[node]-bz;
-                float r2 = dx*dx+dy*dy+dz*dz+eps2;
-                float size = fmaxf(nmaxx[node]-nminx[node],
-                             fmaxf(nmaxy[node]-nminy[node], nmaxz[node]-nminz[node]));
-                if (size*size < theta2*r2) {  // far enough -> approximate
-                    float inv = rsqrtf(r2);
-                    float f = G*nm[node]*inv*inv*inv;
-                    fx+=f*dx; fy+=f*dy; fz+=f*dz;
-                } else {                      // open
-                    if (sp < 62) { stack[sp++] = left[node]; stack[sp++] = right[node]; }
-                }
+            } else if (nsize2[node] < theta2*r2) {   // far enough -> approximate
+                float inv = rsqrtf(r2);
+                float f = G*c.w*inv*inv*inv;
+                fx+=f*dx; fy+=f*dy; fz+=f*dz;
+            } else if (sp < 62) {             // open
+                stack[sp++] = left[node]; stack[sp++] = right[node];
             }
         }
         ax[i]=fx; ay[i]=fy; az[i]=fz;
@@ -297,7 +291,8 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
     CUDA_CHECK(cudaMalloc(&accx_, fb)); CUDA_CHECK(cudaMalloc(&accy_, fb)); CUDA_CHECK(cudaMalloc(&accz_, fb));
     CUDA_CHECK(cudaMalloc(&mass_, fb));
     // tree node arrays
-    CUDA_CHECK(cudaMalloc(&nm_,fn));  CUDA_CHECK(cudaMalloc(&ncx_,fn)); CUDA_CHECK(cudaMalloc(&ncy_,fn)); CUDA_CHECK(cudaMalloc(&ncz_,fn));
+    CUDA_CHECK(cudaMalloc(&ncom_, sizeof(float4)*capacity_));
+    CUDA_CHECK(cudaMalloc(&nsize2_, fn));
     CUDA_CHECK(cudaMalloc(&nminx_,fn)); CUDA_CHECK(cudaMalloc(&nminy_,fn)); CUDA_CHECK(cudaMalloc(&nminz_,fn));
     CUDA_CHECK(cudaMalloc(&nmaxx_,fn)); CUDA_CHECK(cudaMalloc(&nmaxy_,fn)); CUDA_CHECK(cudaMalloc(&nmaxz_,fn));
     CUDA_CHECK(cudaMalloc(&left_,  sizeof(int)*nbodies_));
@@ -485,33 +480,59 @@ Simulation::Simulation(const SimParams& p) : p_(p), nbodies_(p.n + p.nGas + p.nD
             // haloes (proto-galaxies) that merge hierarchically. H0 is set just
             // below the binding value so the box expands, turns around, and the
             // cosmic web condenses out of it.
-            const float R0   = 3.2f;                       // initial radius (wide)
+            const float R0   = 220.0f;                     // half-extent of the cube (huge box, wide spacing)
             const float Mtot = 1.0f;                       // total (stars carry it)
             const float Hc   = sqrtf(2.0f*G*Mtot/(R0*R0*R0));
-            const float H0   = 0.72f*Hc;                   // sub-critical expansion
-            const float vpec = 0.45f;                      // growing-mode amplitude
+            const float H0   = 0.95f*Hc;                   // near-critical: keeps expanding,
+                                                           // particles stay spread (less collapse)
+            const float PI   = 3.14159265f;
 
-            // random Fourier displacement modes (~large-scale power, amp ~ 1/k)
-            const int NM=14;
+            // --- Gaussian random displacement field with a ΛCDM-like P(k) ---
+            // Real cosmic-web structure spans many scales: huge voids bounded by
+            // sheets, sheets draining into filaments, filaments knotting into
+            // haloes. A handful of long-wavelength modes only makes a few blobs,
+            // so we sum many modes log-sampled across a decade of wavenumber with
+            // a red-tilted, small-scale-damped spectrum (more power on large
+            // scales, gently cut at small scales like the CDM transfer function).
+            const int   NM   = 48;
+            const float kmin = PI / R0;                    // ~box scale (wavelength 2*R0)
+            const float kmax = 9.0f * kmin;               // finest resolved filaments
+            const float kcut = 6.0f * kmin;               // small-scale damping knee
             float kx[NM],ky[NM],kz[NM],amp[NM],ph[NM],kl[NM];
+            float sumA2 = 0.0f;
             for(int m=0;m<NM;++m){
+                // isotropic random direction
                 float dx=2*uni(rng)-1, dy=2*uni(rng)-1, dz=2*uni(rng)-1;
                 float dl=sqrtf(dx*dx+dy*dy+dz*dz)+1e-4f;
-                float kmag=(1.0f+3.0f*uni(rng))*3.14159265f/R0;   // wavelength R0..R0/4
-                kx[m]=dx/dl*kmag; ky[m]=dy/dl*kmag; kz[m]=dz/dl*kmag;
-                kl[m]=kmag;
-                amp[m]=0.16f*R0*(3.14159265f/R0)/kmag;            // ~1/k (red spectrum)
+                // log-uniform |k| -> even coverage of every scale
+                float kmag=kmin*powf(kmax/kmin, uni(rng));
+                kx[m]=dx/dl*kmag; ky[m]=dy/dl*kmag; kz[m]=dz/dl*kmag; kl[m]=kmag;
+                // red spectrum (~1/k) with a Gaussian small-scale cutoff + random
+                // mode-to-mode amplitude scatter (Rayleigh-ish) for irregularity
+                float damp = expf(-(kmag*kmag)/(kcut*kcut));
+                float a = (kmin/kmag) * damp * (0.5f + uni(rng));
+                amp[m]=a; sumA2 += a*a;
                 ph[m]=uni(rng)*6.2831853f;
             }
+            // Normalize so the RMS Zel'dovich displacement is a fixed fraction of
+            // R0 no matter how many modes we use (keeps the field strong but below
+            // runaway shell-crossing). rms|d| = sqrt(sum amp^2 / 2) before scaling.
+            const float targetRMS = 0.24f * R0;            // structure strength
+            float gscale = (sumA2>1e-12f) ? targetRMS/sqrtf(0.5f*sumA2) : 0.0f;
+            for(int m=0;m<NM;++m) amp[m]*=gscale;
+            const float vpec = 0.50f;                      // growing-mode velocity coupling
+
             auto seedBB=[&](int s,int cnt,float mPart){
                 for(int k=0;k<cnt;++k){ int i=s+k;
-                    float qx,qy,qz,rr;                              // uniform in sphere
-                    do{ qx=2*uni(rng)-1; qy=2*uni(rng)-1; qz=2*uni(rng)-1;
-                        rr=qx*qx+qy*qy+qz*qz; }while(rr>1.0f);
+                    // uniform fill of a big cube [-R0,R0]^3 (no rejection)
+                    float qx=2*uni(rng)-1, qy=2*uni(rng)-1, qz=2*uni(rng)-1;
                     qx*=R0; qy*=R0; qz*=R0;
-                    float px=0,py=0,pz=0;                           // Zel'dovich displacement
+                    // Zel'dovich displacement = gradient of the potential field:
+                    // d = sum_m amp_m cos(k.q+phi) k_hat   (cos so d and its
+                    // velocity stay in phase for a clean growing mode)
+                    float px=0,py=0,pz=0;
                     for(int m=0;m<NM;++m){
-                        float a=amp[m]*sinf(kx[m]*qx+ky[m]*qy+kz[m]*qz+ph[m]);
+                        float a=amp[m]*cosf(kx[m]*qx+ky[m]*qy+kz[m]*qz+ph[m]);
                         px+=a*kx[m]/kl[m]; py+=a*ky[m]/kl[m]; pz+=a*kz[m]/kl[m];
                     }
                     float x=qx+px, y=qy+py, z=qz+pz;
@@ -549,7 +570,7 @@ Simulation::~Simulation() {
     cudaFree(velx_);cudaFree(vely_);cudaFree(velz_);
     cudaFree(accx_);cudaFree(accy_);cudaFree(accz_);
     cudaFree(mass_);
-    cudaFree(nm_);cudaFree(ncx_);cudaFree(ncy_);cudaFree(ncz_);
+    cudaFree(ncom_);cudaFree(nsize2_);
     cudaFree(nminx_);cudaFree(nminy_);cudaFree(nminz_);
     cudaFree(nmaxx_);cudaFree(nmaxy_);cudaFree(nmaxz_);
     cudaFree(left_);cudaFree(right_);cudaFree(parent_);cudaFree(visited_);
@@ -559,9 +580,9 @@ Simulation::~Simulation() {
 void Simulation::centerOfMass(float& x, float& y, float& z) {
     if(!treeBuilt_){ x=y=z=0.0f; return; }
     // Root internal node (id 0) carries the total mass-weighted COM.
-    cudaMemcpy(&x, ncx_, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&y, ncy_, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&z, ncz_, sizeof(float), cudaMemcpyDeviceToHost);
+    float4 com;
+    cudaMemcpy(&com, ncom_, sizeof(float4), cudaMemcpyDeviceToHost);
+    x = com.x; y = com.y; z = com.z;
 }
 
 void Simulation::buildTree() {
@@ -578,27 +599,25 @@ void Simulation::buildTree() {
 
     buildTreeKernel<<<gn,BLOCK>>>(code_,nbodies_,left_,right_,parent_);
     initLeavesKernel<<<gn,BLOCK>>>(posx_,posy_,posz_,mass_,idx_,nbodies_,
-        nm_,ncx_,ncy_,ncz_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
+        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
 }
 
 void Simulation::summarize() {
     summarizeKernel<<<grid(nbodies_),BLOCK>>>(parent_,left_,right_,nbodies_,
-        nm_,ncx_,ncy_,ncz_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
+        ncom_,nsize2_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,visited_);
 }
 
 void Simulation::computeAccelOnly() {
     buildTree(); summarize();
     forcesKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,idx_,left_,right_,
-        nm_,ncx_,ncy_,ncz_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,
-        accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
+        ncom_,nsize2_,accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void Simulation::step() {
     buildTree(); summarize();
     forcesKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,idx_,left_,right_,
-        nm_,ncx_,ncy_,ncz_,nminx_,nminy_,nminz_,nmaxx_,nmaxy_,nmaxz_,
-        accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
+        ncom_,nsize2_,accx_,accy_,accz_,nbodies_,p_.theta,p_.eps*p_.eps,p_.G);
     integrateKernel<<<grid(nbodies_),BLOCK>>>(posx_,posy_,posz_,velx_,vely_,velz_,
         accx_,accy_,accz_,nbodies_,p_.dt,p_.damping);
 }

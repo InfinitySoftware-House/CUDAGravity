@@ -28,6 +28,13 @@
 #include <random>
 #include <chrono>
 #include <ctime>
+#include <csignal>
+
+// Set on SIGINT/SIGTERM so the render loop can exit cleanly (close the ffmpeg
+// pipe, flush the last frames) instead of the OS killing us mid-write and
+// leaving a truncated/corrupt mp4.
+static volatile std::sig_atomic_t g_quitRequested = 0;
+static void onTermSignal(int){ g_quitRequested = 1; }
 
 // ---------------------------------------------------------------------------
 //  Headless modes (no OpenGL needed)
@@ -104,7 +111,7 @@ static bool  g_restart=false;          // edge flag: rebuild sim with g_preset
 static bool  g_clouds=true;            // render ambient nebulae + dust
 static bool  g_orbit=false;            // auto-orbit the centre of mass
 static float g_orbAz=0.0f, g_orbEl=0.35f, g_orbR=4.0f;   // orbit angle/elev/radius
-static float g_orbSpeed=0.0035f;       // radians per frame
+static float g_orbSpeed=0.0015f;       // radians per frame
 static double g_lastX=0, g_lastY=0;
 
 static void vnorm(float*v){ float l=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(l>1e-8f){v[0]/=l;v[1]/=l;v[2]/=l;} }
@@ -116,9 +123,9 @@ static void vrot(float*v,const float*k,float ang){
     for(int i=0;i<3;++i) v[i]=v[i]*c + cx[i]*s + k[i]*kv*(1.0f-c);
 }
 static void camReset(){
-    // Big Bang fills a much larger volume (R0~3.2) than the galaxy presets, so
-    // start the camera further back to frame the whole forming cosmic web.
-    float d = (g_preset==7) ? 8.0f : 1.0f;
+    // Big Bang fills a huge cube (half-extent R0=220) far larger than the galaxy
+    // presets, so start the camera further back to frame the whole box.
+    float d = (g_preset==7) ? 540.0f : 1.0f;
     g_camPos[0]=1.6f*d; g_camPos[1]=1.3f*d; g_camPos[2]=2.2f*d;
     float f[3]={-g_camPos[0],-g_camPos[1],-g_camPos[2]}; vnorm(f);
     float wup[3]={0,1,0}, r[3]; vcross(f,wup,r); vnorm(r);
@@ -204,9 +211,9 @@ void main(){
     float r2 = dot(d,d);
     if(r2 > 0.25) discard;
     float core = exp(-r2 * 22.0);          // tight bright core
-    float halo = exp(-r2 * 6.0) * 0.12;     // faint surrounding glow
+    float halo = exp(-r2 * 6.0) * 0.06;     // faint surrounding glow
     float a = core + halo;
-    FragColor = vec4(vColor * vBright * a * 1.5, a);   // HDR, additive
+    FragColor = vec4(vColor * vBright * a * 1.1, a);   // HDR, additive
 }
 )";
 
@@ -258,7 +265,15 @@ void main(){
     vec2 d = gl_PointCoord - vec2(0.5);
     float r2 = dot(d,d);
     if(r2 > 0.25) discard;
-    float a = exp(-r2 * 7.0) * (1.0 - smoothstep(0.18, 0.25, r2));
+    // soft radial envelope (no hard rim)
+    float rad = exp(-r2 * 4.0) * (1.0 - smoothstep(0.04, 0.25, r2));
+    // fractal turbulence: break the round disc into irregular wisps + voids so
+    // the gas reads as ragged dust, not a circular blob. Domain mixes per-sprite
+    // world position with the local sprite UV -> every sprite looks different.
+    vec3 q = vWorld*7.0 + vec3(gl_PointCoord*3.5, 0.0);
+    float fb = 0.55*vnoise(q) + 0.28*vnoise(q*2.3) + 0.17*vnoise(q*4.9);
+    fb = smoothstep(0.35, 0.95, fb);   // sharpen -> filaments, carve holes
+    float a = rad * fb;
     o = vec4(emission(vWorld) * vW * a, a);   // HDR additive (blend ONE,ONE)
 }
 )";
@@ -372,8 +387,8 @@ static void buildCloudAttrs(int nStars,int nGas,int nDust, std::vector<float>& a
     attr.assign((size_t)total*2, 0.0f);
     std::mt19937 rng(7u); std::uniform_real_distribution<float> uni(0,1);
     for(int i=nStars; i<nStars+nGas; ++i){
-        attr[2*i+0] = 0.014f + 0.026f*uni(rng);     // world-space radius (small)
-        attr[2*i+1] = 0.010f + 0.020f*uni(rng);     // additive brightness (dim)
+        attr[2*i+0] = 0.020f + 0.040f*uni(rng);     // world-space radius (modest)
+        attr[2*i+1] = 0.004f + 0.008f*uni(rng);     // additive brightness (faint)
     }
     for(int i=nStars+nGas; i<total; ++i){
         attr[2*i+0] = 0.010f + 0.020f*uni(rng);     // radius
@@ -425,7 +440,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
     auto countsFor=[&](int preset,int& ns,int& ng,int& nd){
         if(preset==7){ ns=(cliN>0?cliN:1000000); ng=0; nd=0; }
         else { ns=(cliN>0?cliN:100000);
-               ng=(cliGas>=0?cliGas:ns/5); nd=(cliDust>=0?cliDust:ns/10); }
+               ng=(cliGas>=0?cliGas:ns/16); nd=(cliDust>=0?cliDust:ns/10); }
         if(ns<2) ns=2;
     };
 
@@ -521,10 +536,14 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
 
     double fpsT=glfwGetTime(); int frames=0;
     double recStartT=0, lastFrameT=glfwGetTime();   // headless progress timing
+    double emaFps=0.0;                              // trailing fps for a responsive ETA
     bool orbitPrev=false; float com[3]={0,0,0};     // auto-orbit state
     if(autoRecord) g_toggleRecord=true;      // begin recording on the first frame
 
-    while(!glfwWindowShouldClose(win)){
+    std::signal(SIGINT,  onTermSignal);
+    std::signal(SIGTERM, onTermSignal);
+
+    while(!glfwWindowShouldClose(win) && !g_quitRequested){
         // switch initial-condition template (keys 1..7) -> rebuild the simulation,
         // reallocating the body buffers first if the particle count changed.
         if(g_restart){
@@ -594,7 +613,7 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         if(glfwGetKey(win,GLFW_KEY_A)==GLFW_PRESS) moveCam(g_r,-spd);
         if(glfwGetKey(win,GLFW_KEY_E)==GLFW_PRESS) moveCam(g_u, spd);
         if(glfwGetKey(win,GLFW_KEY_Q)==GLFW_PRESS) moveCam(g_u,-spd);
-        if(g_autospin){ vrot(g_f,g_u,0.0015f); vrot(g_r,g_u,0.0015f); }
+        if(g_autospin){ vrot(g_f,g_u,0.0007f); vrot(g_r,g_u,0.0007f); }
 
         // --- auto-orbit the centre of mass (O / --orbit) ---
         sim->centerOfMass(com[0],com[1],com[2]);
@@ -619,7 +638,14 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
 
         float camDist=std::sqrt(g_camPos[0]*g_camPos[0]+g_camPos[1]*g_camPos[1]+g_camPos[2]*g_camPos[2]);
         float ctr[3]={g_camPos[0]+g_f[0], g_camPos[1]+g_f[1], g_camPos[2]+g_f[2]};
-        Mat4 proj=perspective(1.0f,(float)rw/(float)rh,0.02f,200.0f);
+        // Clip planes scale with camera distance so any preset scale is in view.
+        // The Big Bang box (half-extent ~220, camera ~1600 out) sits far beyond a
+        // fixed far plane, which would clip the whole scene to black; tying far to
+        // camDist keeps it framed. Depth test is off for the additive stars, so
+        // the wide near/far range costs no depth precision.
+        float zfar = camDist*3.0f + 50.0f;
+        float znear = fmaxf(0.02f, camDist*0.001f);
+        Mat4 proj=perspective(1.0f,(float)rw/(float)rh,znear,zfar);
         Mat4 view=lookAt(g_camPos[0],g_camPos[1],g_camPos[2], ctr[0],ctr[1],ctr[2], g_u[0],g_u[1],g_u[2]);
         Mat4 mvp=mul(proj,view);
 
@@ -676,7 +702,9 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
             glUseProgram(progBright);
             glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,scene.tex);
             glUniform1i(glGetUniformLocation(progBright,"uScene"),0);
-            glUniform1f(glGetUniformLocation(progBright,"uThresh"),1.3f);
+            // Big Bang (7) packs 1M additive stars -> blown-out glow. Raise the
+            // bloom threshold there so only the brightest cores bleed.
+            glUniform1f(glGetUniformLocation(progBright,"uThresh"), g_preset==7 ? 2.6f : 1.3f);
             glDrawArrays(GL_TRIANGLES,0,3);
 
             glUseProgram(progBlur);
@@ -702,8 +730,10 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
         glUniform1i(glGetUniformLocation(progComp,"uScene"),0);
         glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,blurA.tex);
         glUniform1i(glGetUniformLocation(progComp,"uBloom"),1);
-        glUniform1f(glGetUniformLocation(progComp,"uExposure"),1.1f);
-        glUniform1f(glGetUniformLocation(progComp,"uBloomAmt"), doBloom ? 0.55f : 0.0f);
+        // Big Bang (7): 1M additive stars + dense clumps blow out -> dim exposure.
+        glUniform1f(glGetUniformLocation(progComp,"uExposure"), g_preset==7 ? 0.5f : 1.1f);
+        float bloomAmt = doBloom ? (g_preset==7 ? 0.10f : 0.30f) : 0.0f;
+        glUniform1f(glGetUniformLocation(progComp,"uBloomAmt"), bloomAmt);
         glBindVertexArray(fsVao);
         glDrawArrays(GL_TRIANGLES,0,3);
 
@@ -718,9 +748,12 @@ static int runViewer(SimParams p, int cliN, int cliGas, int cliDust,
                 double now=glfwGetTime();
                 if(recStartT==0) recStartT=now;
                 double inst = 1.0/((now-lastFrameT)>1e-6 ? now-lastFrameT : 1e-6);
-                double avg  = recFrames/((now-recStartT)>1e-6 ? now-recStartT : 1.0);
+                // EMA of recent fps -> ETA reflects the *current* step cost, which
+                // keeps rising as the Big Bang clusters (deeper Barnes-Hut tree).
+                // A cumulative average would lag and under-report the remaining time.
+                emaFps = (emaFps<=0.0) ? inst : (0.92*emaFps + 0.08*inst);
                 if(autoRecFrames>0){
-                    double eta=(autoRecFrames-recFrames)/(avg>1e-6?avg:1e-6);
+                    double eta=(autoRecFrames-recFrames)/(emaFps>1e-6?emaFps:1e-6);
                     std::printf("\r[REC] frame %d/%d (%.1f%%) | %.1f fps x%d = %.0f steps/s | ETA %4.0fs   ",
                         recFrames,autoRecFrames,100.0*recFrames/autoRecFrames,
                         inst,subSteps,inst*subSteps,eta);
@@ -773,6 +806,7 @@ int main(int argc,char** argv){
     bool headless=false; int recFps=60, subSteps=1;
     int capW=1920, capH=1080, recCrf=18; bool orbitOn=false;
     int nArg=-1, gasArg=-1, dustArg=-1;        // <0 -> use per-preset default
+    bool seedGiven=false;                       // --seed pins the IC; else randomize
     for(int i=1;i<argc;++i){ std::string a=argv[i];
         if(a=="--bench") mode=BENCH;
         else if(a=="--verify") mode=VERIFY;
@@ -793,9 +827,15 @@ int main(int argc,char** argv){
         else if(a.rfind("--steps=",0)==0) steps=std::atoi(a.c_str()+8);
         else if(a.rfind("--theta=",0)==0) p.theta=(float)std::atof(a.c_str()+8);
         else if(a.rfind("--dt=",0)==0)    p.dt=(float)std::atof(a.c_str()+5);
+        else if(a.rfind("--seed=",0)==0){ p.seed=(uint32_t)std::strtoul(a.c_str()+7,nullptr,10); seedGiven=true; }
         else { std::fprintf(stderr,"unknown arg: %s\n",a.c_str()); return 1; } }
     if(nArg>=0) p.n=nArg;
     if(p.n<2) p.n=2;
+    // Fresh randomness each run unless the user pins it with --seed=N. The seed is
+    // printed so any run you like can be reproduced exactly later.
+    if(!seedGiven){ std::random_device rd; p.seed=((uint32_t)rd()<<1)^(uint32_t)std::time(nullptr); }
+    if(seedGiven) std::printf("seed = %u (pinned)\n", p.seed);
+    else          std::printf("seed = %u (random; pass --seed=%u to reproduce this run)\n", p.seed, p.seed);
     // bench/verify stay pure-star (numbers comparable); the viewer picks the
     // star/gas/dust counts per preset (see countsFor in runViewer).
     switch(mode){ case BENCH: return runBench(p,steps); case VERIFY: return runVerify(p);

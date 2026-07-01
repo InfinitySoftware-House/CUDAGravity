@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector_types.h>   // float4 (lightweight, no full CUDA runtime needed)
 
 // Public host-side interface to the 3D CUDA Barnes-Hut simulation.
 // Implementation lives in barnes_hut.cu (compiled by nvcc).
@@ -68,8 +69,8 @@ private:
     float* mass_ = nullptr;
 
     // LBVH tree-node arrays. Node id space [0,2n-1): internal [0,n-1), leaves [n-1,2n-1).
-    float* nm_   = nullptr;                                  // node mass
-    float* ncx_  = nullptr; float* ncy_ = nullptr; float* ncz_ = nullptr;   // node COM
+    float4* ncom_ = nullptr;    // node centre of mass + mass packed (x,y,z,m)
+    float*  nsize2_ = nullptr;  // node size^2, precomputed for the BH opening test
     float* nminx_ = nullptr; float* nminy_ = nullptr; float* nminz_ = nullptr;  // node AABB
     float* nmaxx_ = nullptr; float* nmaxy_ = nullptr; float* nmaxz_ = nullptr;
     int*   left_   = nullptr;   // internal-node children (size n)
